@@ -2,6 +2,7 @@
 #define __PHOENIX_H__
 
 #include <linux/types.h>
+#include <linux/version.h>
 #include <linux/blk-mq.h>
 #include <linux/nvme.h>
 #include <linux/memremap.h>
@@ -10,6 +11,7 @@
 #include <linux/mmzone.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
+#include <linux/pci-p2pdma.h>
 #include <linux/printk.h>
 #include <linux/workqueue.h>
 
@@ -63,6 +65,25 @@ extern int phxfs_debug;
 #endif
 
 /*
+ * A BAR range that some other mapping already holds a non-write-back memtype
+ * for, as parsed out of the kernel's PAT memtype list. devm_memremap_pages()
+ * refuses to remap such a range, so the segment builder has to route around it.
+ */
+struct phxfs_pat_conflict {
+	u64 start;
+	u64 end;
+};
+
+/*
+ * Read the PAT memtype list and extract the conflict ranges overlapping
+ * [bar_start, bar_start + bar_len). Returns the number of conflicts found, or
+ * a negative errno. conflicts[] is caller-allocated with max_entries capacity.
+ */
+int phxfs_read_pat_conflicts(u64 bar_start, u64 bar_len,
+			     struct phxfs_pat_conflict *conflicts,
+			     int max_entries);
+
+/*
  * BAR mapping mode (module param phxfs_map_mode).
  *
  *   FULL    : remap the whole GPU BAR at probe. Any registered user GPU
@@ -97,6 +118,42 @@ extern int phxfs_debug;
 #endif
 extern int phxfs_map_mode;
 
+/*
+ * Mirror of the kernel-private struct pci_p2pdma_pagemap, which lives in
+ * drivers/pci/p2pdma.c and in no header at all.
+ *
+ * The kernel's to_p2p_pgmap() container_of()s a pgmap pointer back to the
+ * enclosing struct, so this layout has to match the running kernel exactly --
+ * and the kernel only ever reads those fields once pdev->p2pdma is set, i.e.
+ * after phxfs_p2pdma_bootstrap() has registered a bootstrap slice.
+ *
+ * Upstream reshuffled it twice:
+ *   <= 6.6    { pgmap, struct pci_dev *provider, u64 bus_offset }
+ *   6.7 - 6.18{ struct pci_dev *provider, u64 bus_offset, pgmap }  (4a7ce8334965)
+ *   >= 7.0    { pgmap, struct p2pdma_provider *mem }
+ * phxfs_p2pdma_verify_layout() checks this assumption at load time against a
+ * pgmap the kernel built itself, so the next change fails the load instead of
+ * dereferencing garbage from the NVMe submit path.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+struct phxfs_pgmap {
+	struct dev_pagemap pgmap;
+	struct p2pdma_provider *mem;
+};
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 7, 0)
+struct phxfs_pgmap {
+	struct pci_dev *provider;
+	u64 bus_offset;
+	struct dev_pagemap pgmap;
+};
+#else
+struct phxfs_pgmap {
+	struct dev_pagemap pgmap;
+	struct pci_dev *provider;
+	u64 bus_offset;
+};
+#endif
+
 struct phxfs_bar_segment {
 	u64 phys_start;    /* physical start address of this segment */
 	u64 size;          /* segment size (multiple of PHXFS_REMAP_UNIT_SIZE) */
@@ -105,13 +162,7 @@ struct phxfs_bar_segment {
 			    * 0 means "reclaimable": the release worker may unmap
 			    * it, and until it does the unit stays valid and is
 			    * re-adopted by the next registration that needs it. */
-	struct pci_p2pdma_pagemap *p2p_pgmap;
-};
-
-struct pci_p2pdma_pagemap {
-    struct dev_pagemap pgmap;
-    struct pci_dev provider;
-    u64 bus_offset;
+	struct phxfs_pgmap *p2p_pgmap;
 };
 
 struct phxfs_dev {
@@ -121,11 +172,15 @@ struct phxfs_dev {
     unsigned int devfn;
     u64 size; /* HBM pci bar 4 size */
     u64 paddr; /* HBM bus address space addr */
+    int bar; /* PCI BAR index backing paddr/size, -1 if not resolved */
+    u64 bus_offset; /* pci_bus_address(bar) - pci_resource_start(bar) */
+    u64 p2p_slice_start; /* p2pdma bootstrap slice, 0 if none */
+    u64 p2p_slice_size;
     struct resource pgmap_res;
     struct device device; /* char device. */
     struct cdev cdev;
     int idx;
-    struct pci_p2pdma_pagemap *p2p_pgmap; /* legacy single-segment pgmap (kept for compat) */
+    struct phxfs_pgmap *p2p_pgmap; /* legacy single-segment pgmap (kept for compat) */
     void __iomem *pci_mem_va; /* legacy single-segment VA (kept for compat) */
     bool remap;
     struct phxfs_bar_segment *segments; /* dynamically allocated segment array,
@@ -136,6 +191,45 @@ struct phxfs_dev {
     struct delayed_work seg_release_work; /* unmaps refcount==0 units */
     int seg_release_tries; /* remaining retries for the release worker */
 };
+
+/*
+ * Point one of our pgmaps at the provider the kernel will look for. Only
+ * meaningful once phxfs_p2pdma_bootstrap() has established pdev->p2pdma.
+ *
+ * <= 6.18 reads provider->p2pdma, so a plain pointer is enough and an
+ * un-bootstrapped device degrades into NOT_SUPPORTED (-EREMOTEIO per IO)
+ * rather than a fault. >= 7.0 dereferences the provider pointer itself, so
+ * the lookup has to succeed or the caller must not proceed.
+ */
+static inline int phxfs_pgmap_set_provider(struct phxfs_pgmap *pg,
+					   struct phxfs_dev *dev)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+	/*
+	 * Without CONFIG_PCI_P2PDMA no provider can exist and the kernel never
+	 * routes our pages through p2pdma, so NULL is both safe and correct.
+	 */
+	pg->mem = NULL;
+#ifdef CONFIG_PCI_P2PDMA
+	pg->mem = pcim_p2pdma_provider(dev->dev, dev->bar);
+	if (!pg->mem)
+		return -ENODEV;
+#endif
+	return 0;
+#else
+	pg->provider = dev->dev;
+	pg->bus_offset = dev->bus_offset;
+	return 0;
+#endif
+}
+
+/*
+ * Set up whatever the kernel's p2pdma mapping path needs before any BAR page
+ * gets a struct page, and verify our assumptions about it. Called once per
+ * device before the first remap. Implemented in phxfs-p2pdma.c; a no-op on
+ * kernels built without CONFIG_PCI_P2PDMA.
+ */
+int phxfs_p2pdma_setup(struct phxfs_dev *phx_dev);
 
 struct phxfs_ctrl {
     struct phxfs_dev phx_dev[MAX_DEV_NUM];

@@ -4,7 +4,7 @@ obj-m += phoenixfs.o
 KVER ?= $(shell uname -r)
 ccflags-y += @module_ccflags@
 
-phoenixfs-objs := phxfs-mem.o phxfs-backend.o @VENDOR_BACKEND@ phxfs.o phxfs-p2p-service.o
+phoenixfs-objs := phxfs-mem.o phxfs-backend.o @VENDOR_BACKEND@ phxfs.o phxfs-p2p-service.o phxfs-p2pdma.o
 KERNEL_SRC := /lib/modules/$(KVER)/build
 
 all: phxfs

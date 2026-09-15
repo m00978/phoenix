@@ -70,21 +70,15 @@ MODULE_PARM_DESC(phxfs_staging_release,
 #define PHXFS_PAT_PATH "/sys/kernel/debug/x86/pat_memtype_list"
 #define PHXFS_PAT_BUF_SIZE (64 * 1024) /* PAT file typically < 16 KiB */
 
-/* PAT conflict range recorded during parsing */
-struct phxfs_pat_conflict {
-	u64 start;
-	u64 end;
-};
-
 /*
  * Read PAT memtype list and extract conflict ranges that overlap
  * with [bar_start, bar_start + bar_len).
  * Returns number of conflicts found, or negative errno.
  * conflicts array is allocated by caller with max_entries capacity.
  */
-static int phxfs_read_pat_conflicts(u64 bar_start, u64 bar_len,
-				    struct phxfs_pat_conflict *conflicts,
-				    int max_entries)
+int phxfs_read_pat_conflicts(u64 bar_start, u64 bar_len,
+			     struct phxfs_pat_conflict *conflicts,
+			     int max_entries)
 {
 	struct file *filp;
 	loff_t pos = 0;
@@ -330,6 +324,23 @@ static int phxfs_devm_memremap(struct phxfs_dev *phx_dev) {
 
 		n_conflicts = phxfs_read_pat_conflicts(phx_dev->paddr, phx_dev->size,
 						       conflicts, max_blocks);
+
+		/*
+		 * The p2pdma bootstrap slice is already claimed by its own
+		 * pgmap, so no segment may cover it. Only possible when the
+		 * slice reaches past the head reservation that the segment
+		 * builder starts from; a slice inside that reservation can never
+		 * overlap a candidate block, so injecting it would be a no-op.
+		 */
+		if (n_conflicts >= 0 && phx_dev->p2p_slice_size &&
+		    phx_dev->p2p_slice_start + phx_dev->p2p_slice_size >
+			    phx_dev->paddr + PHXFS_RESERVED_SIZE &&
+		    n_conflicts < max_blocks) {
+			conflicts[n_conflicts].start = phx_dev->p2p_slice_start;
+			conflicts[n_conflicts].end = phx_dev->p2p_slice_start +
+						     phx_dev->p2p_slice_size;
+			n_conflicts++;
+		}
 	}
 	if (n_conflicts < 0) {
 		phxfs_warn("phxfs%d: PAT conflict detection failed (%d), "
@@ -377,12 +388,18 @@ static int phxfs_devm_memremap(struct phxfs_dev *phx_dev) {
 
 	for (i = 0; i < n_segments; i++) {
 		struct dev_pagemap *pgmap;
-		struct pci_p2pdma_pagemap *p2p_pgmap;
+		struct phxfs_pgmap *p2p_pgmap;
 
 		p2p_pgmap = devm_kzalloc(&phx_dev->dev->dev,
-					  sizeof(struct pci_p2pdma_pagemap), GFP_KERNEL);
+					  sizeof(struct phxfs_pgmap), GFP_KERNEL);
 		if (!p2p_pgmap) {
 			ret = -ENOMEM;
+			goto err_cleanup;
+		}
+
+		ret = phxfs_pgmap_set_provider(p2p_pgmap, phx_dev);
+		if (ret) {
+			devm_kfree(&phx_dev->dev->dev, p2p_pgmap);
 			goto err_cleanup;
 		}
 
@@ -454,10 +471,30 @@ fallback_single:
 	{
 		struct dev_pagemap *pgmap;
 
+		/*
+		 * Unlike the segment path above, this covers the head/tail
+		 * reservations too -- including the p2pdma bootstrap slice, whose
+		 * pgmap is already installed on that range. devm_memremap_pages()
+		 * may therefore refuse it; the slice is only 2 MiB at the very
+		 * start of the BAR, so this is the one place where the bootstrap
+		 * can get in our way.
+		 */
+		if (phx_dev->p2p_slice_size)
+			phxfs_warn("phxfs%d: full-BAR fallback overlaps the p2pdma "
+			       "bootstrap slice [0x%llx+0x%llx)\n", phx_dev->idx,
+			       phx_dev->p2p_slice_start, phx_dev->p2p_slice_size);
+
 		phx_dev->p2p_pgmap = devm_kzalloc(&phx_dev->dev->dev,
-						    sizeof(struct pci_p2pdma_pagemap), GFP_KERNEL);
+						    sizeof(struct phxfs_pgmap), GFP_KERNEL);
 		if (!phx_dev->p2p_pgmap)
 			return -ENOMEM;
+
+		ret = phxfs_pgmap_set_provider(phx_dev->p2p_pgmap, phx_dev);
+		if (ret) {
+			devm_kfree(&phx_dev->dev->dev, phx_dev->p2p_pgmap);
+			phx_dev->p2p_pgmap = NULL;
+			return ret;
+		}
 
 	phxfs_info("npu_devm_memremap 1\n");
 		pgmap = &phx_dev->p2p_pgmap->pgmap;
@@ -587,7 +624,7 @@ static int phxfs_remap_span_locked(struct phxfs_dev *phx_dev, u64 phys_start,
 				   u64 phys_end)
 {
 	struct dev_pagemap *pgmap;
-	struct pci_p2pdma_pagemap *p2p_pgmap;
+	struct phxfs_pgmap *p2p_pgmap;
 	void *va;
 	u64 size;
 	int ins = 0, ret;
@@ -613,9 +650,15 @@ static int phxfs_remap_span_locked(struct phxfs_dev *phx_dev, u64 phys_start,
 		return ret;
 
 	p2p_pgmap = devm_kzalloc(&phx_dev->dev->dev,
-				 sizeof(struct pci_p2pdma_pagemap), GFP_KERNEL);
+				 sizeof(struct phxfs_pgmap), GFP_KERNEL);
 	if (!p2p_pgmap)
 		return -ENOMEM;
+
+	ret = phxfs_pgmap_set_provider(p2p_pgmap, phx_dev);
+	if (ret) {
+		devm_kfree(&phx_dev->dev->dev, p2p_pgmap);
+		return ret;
+	}
 
 	pgmap = &p2p_pgmap->pgmap;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
@@ -885,12 +928,21 @@ static int phxfs_ctrl_init(struct phxfs_ctrl *dev_ctrl, u32 dev_num) {
 			phxfs_warn("npu%u: pci_get_domain_bus_and_slot failed\n", i);
 			return -1;
 		}
+		dev_ctrl->phx_dev[i].bar = -1;
+		dev_ctrl->phx_dev[i].bus_offset = 0;
+		dev_ctrl->phx_dev[i].p2p_slice_start = 0;
+		dev_ctrl->phx_dev[i].p2p_slice_size = 0;
 		// for (j = 0; j < PCI_STD_NUM_BARS; j++) {
 		for (j = 0; j <= PCI_STD_RESOURCE_END; j++) {
-			size = pci_resource_len(dev_ctrl->phx_dev[i].dev, j);
+			struct pci_dev *pdev = dev_ctrl->phx_dev[i].dev;
+
+			size = pci_resource_len(pdev, j);
 			if (size > dev_ctrl->phx_dev[i].size){
-				dev_ctrl->phx_dev[i].paddr = pci_resource_start(dev_ctrl->phx_dev[i].dev, j);
+				dev_ctrl->phx_dev[i].paddr = pci_resource_start(pdev, j);
 				dev_ctrl->phx_dev[i].size = size;
+				dev_ctrl->phx_dev[i].bar = j;
+				dev_ctrl->phx_dev[i].bus_offset =
+					pci_bus_address(pdev, j) - pci_resource_start(pdev, j);
 			}
 		}
 		dev_ctrl->phx_dev[i].idx = i;
@@ -905,6 +957,16 @@ static int phxfs_ctrl_init(struct phxfs_ctrl *dev_ctrl, u32 dev_num) {
 		phxfs_info("npu%u: bus is %x, size is %llu, paddr is %llx\n", i,
 			dev_ctrl->phx_dev[i].dev->bus->number, dev_ctrl->phx_dev[i].size,
 			dev_ctrl->phx_dev[i].paddr);
+		/*
+		 * Must happen before any remap: on kernels that route our BAR
+		 * pages through the p2pdma mapping path, every page we hand a
+		 * struct page to needs the device's p2pdma provider to exist
+		 * first. No-op elsewhere.
+		 */
+		ret = phxfs_p2pdma_setup(&dev_ctrl->phx_dev[i]);
+		if (ret)
+			return ret;
+
 		/*
 		 * Full mode remaps the whole BAR up front. Staging mode defers
 		 * the remap to the first registration (phxfs_map_dev_addr_inner),
