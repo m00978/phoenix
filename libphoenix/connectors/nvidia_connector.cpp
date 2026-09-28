@@ -22,9 +22,11 @@
 #include <cctype>
 #include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <string>
 #include <pthread.h>
+#include <unistd.h>
 
 #include "devconnector.h"
 
@@ -123,59 +125,15 @@ static int nvidia_find_device(int cuda_gpu_id)
 /* Reverse of find_device: phxfs index -> CUDA device id, by matching the
  * phxfs sysfs pci_bdf against each CUDA device's PCI bus id. Returns the CUDA
  * device id (>=0) or -1. */
-static int nvidia_phxfs_to_cuda(int phxfs_dev)
-{
-    std::string sysfs_path = "/sys/class/phxfs-generic/phxfs_dev"
-                             + std::to_string(phxfs_dev) + "/pci_bdf";
-    std::ifstream ifs(sysfs_path);
-    if (!ifs.is_open())
-        return -1;
-    std::string sysfs_bdf;
-    if (!std::getline(ifs, sysfs_bdf))
-        return -1;
-    while (!sysfs_bdf.empty() &&
-           (sysfs_bdf.back() == '\n' || sysfs_bdf.back() == '\r' ||
-            sysfs_bdf.back() == ' '  || sysfs_bdf.back() == '\t'))
-        sysfs_bdf.pop_back();
-
-    int n_gpus = 0;
-    if (cudaGetDeviceCount(&n_gpus) != cudaSuccess)
-        return -1;
-    for (int g = 0; g < n_gpus; g++) {
-        char cuda_bdf[32];
-        if (cudaDeviceGetPCIBusId(cuda_bdf, sizeof(cuda_bdf), g) != cudaSuccess)
-            continue;
-        if (bdf_equal(cuda_bdf, sysfs_bdf))
-            return g;
-    }
-    return -1;
-}
-
-/*
- * Staging pool allocation.
- *
- * The kernel remaps the pool's BAR range in 2MiB units and requires every
- * fresh unit to be wholly owned by the pool, so ideally we would allocate in
- * 2MiB physical chunks. The CUDA VMM API (cuMemCreate) offers exactly that,
- * but VMM mappings cannot be pinned by the legacy nvidia_p2p_get_pages API
- * the kernel module uses (EINVAL), and the DMA-BUF P2P path that supports
- * VMM requires kernel >= 5.12 -- so on kernel 5.4 the pool must stay on
- * cudaMalloc. Large cudaMalloc allocations are backed by 2MiB large pages in
- * practice, which tiles the kernel's units; if the driver ever falls back to
- * 64KiB small pages (fragmentation), the kernel's exclusive-unit check
- * rejects the registration loudly instead of silently breaking RDMA/peermem
- * registration of unrelated GPU memory.
- */
-static int nvidia_mem_alloc(int phxfs_dev, size_t size, void **dptr)
+static int nvidia_mem_alloc(int device_id, size_t size, void **dptr)
 {
     if (!dptr)
         return -EINVAL;
-    int cuda_id = nvidia_phxfs_to_cuda(phxfs_dev);
-    if (cuda_id < 0) {
-        fprintf(stderr, "nvidia_mem_alloc: no CUDA device for phxfs dev %d\n",
-                phxfs_dev);
+    int n_gpus = 0;
+    if (cudaGetDeviceCount(&n_gpus) != cudaSuccess ||
+        device_id < 0 || device_id >= n_gpus)
         return -ENODEV;
-    }
+    int cuda_id = device_id;
     /* Allocate on the phxfs device's accelerator, but restore the caller's
      * current device afterwards so we don't disturb the application's CUDA
      * context state. */
@@ -196,10 +154,20 @@ static int nvidia_mem_alloc(int phxfs_dev, size_t size, void **dptr)
     return 0;
 }
 
+extern "C" int phx_connector_probe_alloc(int device_id, size_t size, void **ptr)
+{
+    return nvidia_mem_alloc(device_id, size, ptr);
+}
+
 static void nvidia_mem_free(void *dptr)
 {
     if (dptr)
         cudaFree(dptr);
+}
+
+extern "C" void phx_connector_probe_free(void *ptr)
+{
+    nvidia_mem_free(ptr);
 }
 
 /* Synchronous device-to-device copy. cudaMemcpy(...DeviceToDevice) does not
@@ -213,6 +181,47 @@ static int nvidia_memcpy_dtod(void *dst, const void *src, size_t n)
         return -EIO;
     }
     return 0;
+}
+
+static int nvidia_host_alloc(size_t size, void **ptr)
+{
+    if (!ptr || size == 0)
+        return -EINVAL;
+    cudaError_t rc = cudaMallocHost(ptr, size);
+    if (rc != cudaSuccess) {
+        fprintf(stderr, "nvidia_host_alloc: %s\n", cudaGetErrorString(rc));
+        *ptr = nullptr;
+        return -ENOMEM;
+    }
+    return 0;
+}
+
+static void nvidia_host_free(void *ptr)
+{
+    if (ptr)
+        cudaFreeHost(ptr);
+}
+
+static int nvidia_set_device(int device_id)
+{
+    int n_gpus = 0;
+    if (cudaGetDeviceCount(&n_gpus) != cudaSuccess ||
+        device_id < 0 || device_id >= n_gpus ||
+        cudaSetDevice(device_id) != cudaSuccess)
+        return -ENODEV;
+    return 0;
+}
+
+static int nvidia_memcpy_h2d(void *dst, const void *src, size_t n)
+{
+    cudaError_t rc = cudaMemcpy(dst, src, n, cudaMemcpyHostToDevice);
+    return rc == cudaSuccess ? 0 : -EIO;
+}
+
+static int nvidia_memcpy_d2h(void *dst, const void *src, size_t n)
+{
+    cudaError_t rc = cudaMemcpy(dst, src, n, cudaMemcpyDeviceToHost);
+    return rc == cudaSuccess ? 0 : -EIO;
 }
 
 /* ------------------------------------------------------------------ */
@@ -230,16 +239,18 @@ static cudaStream_t    g_streams[PHXFS_DEV_SCAN_MAX][NV_MAX_QUEUES];
 static pthread_mutex_t g_stream_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Fetch (creating on first use) the stream for (phxfs_dev, slot). */
-static int nvidia_stream_get(int phxfs_dev, int slot, cudaStream_t *out)
+static int nvidia_stream_get(int device_id, int slot, cudaStream_t *out)
 {
-    if (phxfs_dev < 0 || phxfs_dev >= PHXFS_DEV_SCAN_MAX ||
+    if (device_id < 0 || device_id >= PHXFS_DEV_SCAN_MAX ||
         slot < 0 || slot >= NV_MAX_QUEUES)
         return -EINVAL;
 
     pthread_mutex_lock(&g_stream_lock);
-    if (g_streams[phxfs_dev][slot] == nullptr) {
-        int cuda_id = nvidia_phxfs_to_cuda(phxfs_dev);
-        if (cuda_id < 0) {
+    if (g_streams[device_id][slot] == nullptr) {
+        int cuda_id = device_id;
+        int n_gpus = 0;
+        if (cudaGetDeviceCount(&n_gpus) != cudaSuccess ||
+            cuda_id < 0 || cuda_id >= n_gpus) {
             pthread_mutex_unlock(&g_stream_lock);
             return -ENODEV;
         }
@@ -261,18 +272,18 @@ static int nvidia_stream_get(int phxfs_dev, int slot, cudaStream_t *out)
             pthread_mutex_unlock(&g_stream_lock);
             return -EIO;
         }
-        g_streams[phxfs_dev][slot] = s;
+        g_streams[device_id][slot] = s;
     }
-    *out = g_streams[phxfs_dev][slot];
+    *out = g_streams[device_id][slot];
     pthread_mutex_unlock(&g_stream_lock);
     return 0;
 }
 
-static int nvidia_memcpy_dtod_async(int phxfs_dev, int slot, void *dst,
+static int nvidia_memcpy_dtod_async(int device_id, int slot, void *dst,
                                     const void *src, size_t n)
 {
     cudaStream_t s = nullptr;
-    int rc = nvidia_stream_get(phxfs_dev, slot, &s);
+    int rc = nvidia_stream_get(device_id, slot, &s);
     if (rc != 0)
         return rc;
 
@@ -285,15 +296,15 @@ static int nvidia_memcpy_dtod_async(int phxfs_dev, int slot, void *dst,
     return 0;
 }
 
-static int nvidia_queue_sync(int phxfs_dev, int slot)
+static int nvidia_queue_sync(int device_id, int slot)
 {
-    if (phxfs_dev < 0 || phxfs_dev >= PHXFS_DEV_SCAN_MAX ||
+    if (device_id < 0 || device_id >= PHXFS_DEV_SCAN_MAX ||
         slot < 0 || slot >= NV_MAX_QUEUES)
         return -EINVAL;
 
     /* No stream created => nothing was ever enqueued on it. */
     pthread_mutex_lock(&g_stream_lock);
-    cudaStream_t s = g_streams[phxfs_dev][slot];
+    cudaStream_t s = g_streams[device_id][slot];
     pthread_mutex_unlock(&g_stream_lock);
     if (!s)
         return 0;
@@ -375,6 +386,11 @@ static struct devconn_ops nvidia_devconn = {
     .mem_alloc    = nvidia_mem_alloc,
     .mem_free     = nvidia_mem_free,
     .memcpy_dtod  = nvidia_memcpy_dtod,
+    .host_alloc   = nvidia_host_alloc,
+    .host_free    = nvidia_host_free,
+    .set_device   = nvidia_set_device,
+    .memcpy_h2d   = nvidia_memcpy_h2d,
+    .memcpy_d2h   = nvidia_memcpy_d2h,
     .memcpy_dtod_async = nvidia_memcpy_dtod_async,
     .queue_sync   = nvidia_queue_sync,
     .launch_host_func = nvidia_launch_host_func,

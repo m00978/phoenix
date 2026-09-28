@@ -50,6 +50,9 @@ public:
  * Mirrors PHXFS_MAP_MODE_* in the kernel module's phxfs.h. */
 #define PHX_MAP_MODE_FULL     0   /* direct SSD -> user GPU DMA */
 #define PHX_MAP_MODE_STAGING  1   /* SSD -> Phoenix staging pool -> D2D -> user */
+#define PHX_MAP_MODE_HOST     2   /* generic host-staging fallback */
+#define PHX_HOST_STAGING_SLOTS 4
+#define PHX_HOST_STAGING_BYTES (16ULL * 1024 * 1024)
 
 /* ---- Registration node (one per phxfs_regmem call) ---- */
 typedef struct phxfs_mmap_node_s {
@@ -65,7 +68,8 @@ typedef struct phxfs_mmap_node_s {
 
 /* ---- Per-device state ---- */
 typedef struct phxfs_mmap_buffer_s {
-    int device_id;
+    int device_id;         /* public accelerator id (CUDA/HIP/NPU ordinal) */
+    int phxfs_device_id;   /* internal /dev/phxfs_devN index, or -1 in host mode */
     int bdev_fd;
     bool init_stat;     /* device is OPEN (fd valid, usable) */
     bool closing;       /* close in progress: reject new dev_get() */
@@ -82,6 +86,12 @@ typedef struct phxfs_mmap_buffer_s {
     void  *staging_dptr;    /* Phoenix-owned device staging pool (or NULL) */
     void  *staging_host;    /* host-mapped P2P vaddr of the staging pool */
     size_t staging_size;    /* staging pool byte size */
+
+    /* Host-staging fallback pool: preallocated pinned host slots. */
+    void  *host_staging[PHX_HOST_STAGING_SLOTS];
+    bool   host_staging_busy[PHX_HOST_STAGING_SLOTS];
+    size_t host_staging_size;
+    pthread_cond_t host_staging_cv;
 } phxfs_mmap_buffer_t;
 
 extern int g_device_count;
@@ -90,6 +100,10 @@ extern phxfs_mmap_buffer_t mbuffer[PHXFS_MAX_DEVICES];
 /* ---- phx_device.cpp ---- */
 phxfs_mmap_buffer_t *dev_get(int device_id);
 void dev_put(phxfs_mmap_buffer_t *pb);
+bool phx_host_mode_requested(void);
+bool phx_host_mode_auto(void);
+int phx_probe_direct_device(int device_id);
+int phx_direct_probe(int device_id);
 
 /* ---- phx_io.cpp ---- */
 /* Shared pread/pwrite loop (chunks at PHXFS_IO_CHUNK, retries EINTR,
@@ -130,6 +144,11 @@ int  phx_staging_setup(int device_id);
 /* Free the staging pool. Called during close teardown AFTER the staging
  * registration has been torn down; pb ref is not required. */
 void phx_staging_teardown(phxfs_mmap_buffer_t *pb);
+/* Host-staging fallback pool (same lifecycle as the GPU staging pool). */
+int  phx_host_staging_setup(int device_id);
+void phx_host_staging_teardown(phxfs_mmap_buffer_t *pb);
+void *phx_host_staging_acquire(phxfs_mmap_buffer_t *pb, int *slot);
+void  phx_host_staging_release(phxfs_mmap_buffer_t *pb, int slot);
 /* Run a batch entirely through the staging path (SSD<->staging<->D2D<->user).
  * is_write selects the direction. Returns failed-request count (>=0) or a
  * negative errno, matching phxfs_read_batch/phxfs_write_batch. */

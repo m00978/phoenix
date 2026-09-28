@@ -2,6 +2,49 @@
 
 `libphoenix` is the user-space C/C++ library that simplifies interaction with the `phxfs` kernel module. It manages device metadata and GPU buffer registration/unregistration.
 
+## Quick start
+
+Public device ids are accelerator ordinals: CUDA device ids for NVIDIA, HIP device ids for AMD, and the corresponding ordinal for other connectors. The internal `/dev/phxfs_devN` index is resolved inside `libphoenix` and is never passed by applications.
+
+For NVIDIA Grace Hopper (H100/GH200), Grace Blackwell, and systems where the direct P2P path may be unavailable, use runtime probing with the generic host-staging fallback:
+
+```bash
+export PHXFS_MODE=auto
+```
+
+`auto` opens the direct path when the kernel module and GPU P2P mapping work, then switches to `host_staging` when the probe fails. `host_staging` can be selected explicitly and does not require the Phoenix kernel module:
+
+```bash
+export PHXFS_MODE=host_staging
+```
+
+A minimal synchronous read looks like this:
+
+```c
+int device_id = 0;                 /* CUDA device ordinal */
+void *gpu_buf = NULL, *target = NULL;
+size_t bytes = 16 * 1024 * 1024;
+
+cudaSetDevice(device_id);
+cudaMalloc(&gpu_buf, bytes);
+if (phxfs_open(device_id) != 0)
+    return -1;
+if (phxfs_regmem(device_id, gpu_buf, bytes, &target) != 0)
+    return -1;
+
+int fd = open("weights.bin", O_RDONLY | O_DIRECT);
+ssize_t n = phxfs_read(fd, device_id, gpu_buf, 0, bytes, 0);
+
+close(fd);
+phxfs_deregmem(device_id, gpu_buf, bytes);
+phxfs_close(device_id);
+cudaFree(gpu_buf);
+```
+
+For many independent requests, use `phxfs_read_batch` / `phxfs_write_batch`; for compute/I/O overlap, use `phxfs_batch_submit_read` / `phxfs_batch_submit_write` and later `phxfs_batch_wait`. In host-staging mode, the library reuses preallocated pinned host slots and performs the required CUDA copies internally.
+
+`phxfs_find_dev()` remains as a compatibility helper for older callers. It validates the accelerator ordinal and returns the same public id; applications can pass their CUDA/HIP ordinal directly to every `libphoenix` API.
+
 ## Multi-vendor DevConnector
 
 Vendor-specific calls (device discovery via CUDA/HIP/CANN) are abstracted behind `struct devconn_ops` (`libphoenix/connectors/devconnector.h`). The active connector is selected at **compile time** via `PHXFS_VENDOR` (default `NVIDIA`) and exposed through the global `devconn` pointer. Core files (`phx_device.cpp`, `phx_mem.cpp`, `phx_io.cpp`) call only through `devconn->find_device()` / `page_size` and never include vendor headers (e.g. `cuda.h`).
@@ -12,15 +55,15 @@ Vendor-specific calls (device discovery via CUDA/HIP/CANN) are abstracted behind
 
 ### `phxfs_open`
 ```c++
-int phxfs_open(int deviceID);
+int phxfs_open(int device_id);
 ```
-Opens the character device for `deviceID`, initializes and stores the metadata required for later buffer registration. Opens are reference-counted: a second `phxfs_open` on the same device only adds a client reference.
+Opens the accelerator identified by its public ordinal. `libphoenix` resolves the internal phxfs device index when the kernel module is used; host-staging mode keeps the kernel device closed. Opens are reference-counted: a second `phxfs_open` on the same device only adds a client reference.
 
 ### `phxfs_close`
 ```c++
-int phxfs_close(int deviceID);
+int phxfs_close(int device_id);
 ```
-Drops one client reference on `deviceID`. The last close waits for in-flight operations to drain, then unmaps every registration and closes the device. A concurrent `phxfs_open` on a draining device fails with `-EBUSY` (retryable).
+Drops one client reference on the public accelerator `device_id`. The last close waits for in-flight operations to drain, then unmaps every registration and closes the device. A concurrent `phxfs_open` on a draining device fails with `-EBUSY` (retryable).
 
 ## Buffer management
 
@@ -28,7 +71,7 @@ Drops one client reference on `deviceID`. The last close waits for in-flight ope
 ```c++
 int phxfs_regmem(int device_id, const void *addr, size_t len, void **target_addr);
 ```
-In FULL mode, registers a memory region (`addr`, `len`) for `device_id`: `mmap`s a VMA from the char device, then issues `ioctl(PHXFS_IOCTL_MAP)` to pin the GPU pages into it. Both `addr` and `len` must be non-zero and aligned to the device page size. In STAGING mode, user-buffer registration is a no-op; the internal staging pool is registered during `phxfs_open` and must satisfy the kernel's physical 2 MiB span contract. On success, `target_addr` receives the host-mapped address in FULL mode, or `addr` in STAGING mode — an **internal handle for reference only**; the I/O calls identify a buffer by its original device address `addr`, never by `target_addr`.
+In FULL mode, registers a memory region (`addr`, `len`) for the public accelerator `device_id`: `mmap`s a VMA from the char device, then issues `ioctl(PHXFS_IOCTL_MAP)` to pin the GPU pages into it. Both `addr` and `len` must be non-zero and aligned to the device page size. In STAGING and `host_staging` modes, user-buffer registration is a logical registration with no kernel GPU-page mapping; the internal staging pool is registered during `phxfs_open` and must satisfy the kernel's physical 2 MiB span contract. On success, `target_addr` receives the host-mapped address in FULL mode, or `addr` in STAGING mode — an **internal handle for reference only**; the I/O calls identify a buffer by its original device address `addr`, never by `target_addr`.
 
 Registration semantics: an exact-duplicate registration (same `addr` + `len`, still live) is reference-counted and reused (deregister once per register); any other overlap with a live registration is rejected with `-EINVAL`.
 
@@ -47,7 +90,7 @@ ssize_t phxfs_read (int fd, int device_id, void *buf, off_t buf_offset, ssize_t 
 ssize_t phxfs_write(int fd, int device_id, void *buf, off_t buf_offset, ssize_t nbyte, off_t f_offset);
 ```
 
-`device_id` selects the buffer the same way as the batch API below: `>= 0` means `buf` must lie inside a registration on that phxfs device; `< 0` means `buf` is a plain CPU (host) address. For a registered buffer, `buf` may point anywhere inside the region; the host DMA address is resolved as `vaddr + (buf - registered_base) + buf_offset`, and an internal reference on the mapping is held for the transfer's duration, so a concurrent `phxfs_deregmem` cannot unmap it mid-I/O. Large transfers are chunked at `PHXFS_IO_CHUNK` (1 GiB) to stay under the kernel's `MAX_RW_COUNT`.
+`device_id` selects the buffer the same way as the batch API below: `>= 0` means `buf` must lie inside a registration on that accelerator; `< 0` means `buf` is a plain CPU (host) address. For a registered buffer, `buf` may point anywhere inside the region; the host DMA address is resolved as `vaddr + (buf - registered_base) + buf_offset`, and an internal reference on the mapping is held for the transfer's duration, so a concurrent `phxfs_deregmem` cannot unmap it mid-I/O. Large transfers are chunked at `PHXFS_IO_CHUNK` (1 GiB) to stay under the kernel's `MAX_RW_COUNT`.
 
 ## Batch I/O
 
@@ -58,7 +101,7 @@ For workloads that issue many independent transfers (e.g. KV-cache retrieve/stor
 ```c++
 typedef struct phxfs_io_req {
     int      fd;          // open file descriptor (O_DIRECT recommended)
-    int      device_id;   // >=0: phxfs device the buf is registered on;
+    int      device_id;   // >=0: accelerator ordinal the buf is registered on;
                           //  <0: plain CPU buffer
     void    *buf;         // GPU addr (registered) or CPU addr
     off_t    buf_offset;  // byte offset within buf

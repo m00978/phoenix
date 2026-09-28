@@ -33,11 +33,13 @@ struct devconn_ops {
     int   (*init)(void);
 
     /*
-     * Map a vendor-specific device ID to a phxfs device index.
+     * Validate/map a vendor accelerator ordinal. The public device id
+     * remains the vendor ordinal; the core keeps any internal phxfs index
+     * private to the device state.
      *   NVIDIA: device_id is a CUDA device ID
      *   AMD:    device_id is a HIP device ID
      *   Huawei: device_id is an NPU ID
-     * Returns phxfs device index (>=0) or -1 on failure.
+     * Returns 0-compatible success/failure through the public helper.
      */
     int   (*find_device)(int device_id);
 
@@ -52,9 +54,18 @@ struct devconn_ops {
      * memcpy_dtod: synchronous device-to-device copy (dst and src are both
      *              device pointers). Returns 0 or a negative errno.
      */
-    int   (*mem_alloc)(int phxfs_dev, size_t size, void **dptr);
+    int   (*mem_alloc)(int device_id, size_t size, void **dptr);
     void  (*mem_free)(void *dptr);
     int   (*memcpy_dtod)(void *dst, const void *src, size_t n);
+
+    /* Host-staging operations. These are used when the accelerator exposes
+     * unified virtual addressing but its device pointers are not ordinary
+     * Linux user pages and therefore cannot be passed to pread/pwrite. */
+    int   (*host_alloc)(size_t size, void **ptr);
+    void  (*host_free)(void *ptr);
+    int   (*set_device)(int device_id);
+    int   (*memcpy_h2d)(void *dst, const void *src, size_t n);
+    int   (*memcpy_d2h)(void *dst, const void *src, size_t n);
 
     /*
      * Asynchronous device-to-device copy on a connector-owned queue, plus a

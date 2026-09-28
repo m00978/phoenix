@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <string>
 #include <vector>
+#include <cstdlib>
 
 #include "phoenix.h"
 #include "phx_internal.h"
@@ -26,6 +27,18 @@ static std::vector<std::string> phxfs_dev_path = {
 };
 
 static std::vector<bool> phxfs_initialized(PHXFS_MAX_DEVICES, false);
+
+bool phx_host_mode_requested(void) {
+    const char *mode = std::getenv("PHXFS_MODE");
+    return mode && (strcmp(mode, "host") == 0 ||
+                    strcmp(mode, "host_staging") == 0 ||
+                    strcmp(mode, "auto") == 0);
+}
+
+bool phx_host_mode_auto(void) {
+    const char *mode = std::getenv("PHXFS_MODE");
+    return mode && strcmp(mode, "auto") == 0;
+}
 
 /*
  * Read the kernel BAR mapping mode for a phxfs device from sysfs. Absent node
@@ -45,6 +58,17 @@ static int phxfs_read_map_mode(int device_id) {
     return mode;
 }
 
+int phx_probe_direct_device(int device_id) {
+    if (device_id < 0 || device_id >= g_device_count)
+        return -EINVAL;
+    phxfs_mmap_buffer_t *pb = &mbuffer[device_id];
+    if (!pb->init_stat || pb->bdev_fd < 0)
+        return -ENODEV;
+    if (pb->phxfs_device_id < 0)
+        return -ENODEV;
+    return phx_direct_probe(device_id);
+}
+
 /*
  * Serialises open()/close() across devices so concurrent phxfs_open() from
  * multiple threads (e.g. one worker per GPU) and open-vs-close are safe.
@@ -59,6 +83,7 @@ static void phxfs_dev_ctor(void) {
         pthread_mutex_init(&mbuffer[i].lock, NULL);
         pthread_cond_init(&mbuffer[i].drain_cv, NULL);
         mbuffer[i].init_stat  = false;
+        mbuffer[i].phxfs_device_id = -1;
         mbuffer[i].closing    = false;
         mbuffer[i].open_count = 0;
         mbuffer[i].active_ops = 0;
@@ -69,6 +94,12 @@ static void phxfs_dev_ctor(void) {
         mbuffer[i].staging_dptr = NULL;
         mbuffer[i].staging_host = NULL;
         mbuffer[i].staging_size = 0;
+        for (int s = 0; s < PHX_HOST_STAGING_SLOTS; s++) {
+            mbuffer[i].host_staging[s] = NULL;
+            mbuffer[i].host_staging_busy[s] = false;
+        }
+        mbuffer[i].host_staging_size = 0;
+        pthread_cond_init(&mbuffer[i].host_staging_cv, NULL);
     }
     /* Honour the connector init contract once at load. */
     devconn_init();
@@ -109,8 +140,22 @@ void dev_put(phxfs_mmap_buffer_t *pb) {
  * The process-lifetime lock/drain_cv are NOT destroyed here.
  */
 static void __phxfs_teardown(phxfs_mmap_buffer_t *pb) {
-    free_phxfs_p2p_map(pb);              /* UNMAP + munmap each registration */
+    if (pb->map_mode == PHX_MAP_MODE_HOST) {
+        pthread_mutex_lock(&pb->lock);
+        phxfs_p2p_map_t *m = pb->head;
+        pb->head = NULL;
+        pb->last_hit = NULL;
+        pthread_mutex_unlock(&pb->lock);
+        while (m) {
+            phxfs_p2p_map_t *next = m->next;
+            free(m);
+            m = next;
+        }
+    } else {
+        free_phxfs_p2p_map(pb);          /* UNMAP + munmap each registration */
+    }
     phx_staging_teardown(pb);            /* free the staging pool (staging mode) */
+    phx_host_staging_teardown(pb);   /* free pinned host fallback pool */
     if (pb->bdev_fd >= 0)                /* fd 0 is a valid fd and must be closed too */
         close(pb->bdev_fd);
     pb->bdev_fd  = -1;
@@ -177,7 +222,7 @@ int phxfs_close(int device_id) {
 
 /* Open the char device. lock/drain_cv are process-lifetime (see ctor). */
 static int __phxfs_open(const char *dev_path, phxfs_mmap_buffer_t *mbuffer,
-                        int device_id) {
+                        int device_id, int phxfs_device_id) {
     mbuffer->bdev_fd = open(dev_path, O_RDWR);
 
     if (mbuffer->bdev_fd == -1) {
@@ -186,9 +231,10 @@ static int __phxfs_open(const char *dev_path, phxfs_mmap_buffer_t *mbuffer,
     }
     mbuffer->head = NULL;
     mbuffer->device_id = device_id;
+    mbuffer->phxfs_device_id = phxfs_device_id;
     mbuffer->closing = false;
     mbuffer->active_ops = 0;
-    mbuffer->map_mode = phxfs_read_map_mode(device_id);
+    mbuffer->map_mode = phxfs_read_map_mode(phxfs_device_id);
     mbuffer->staging_raw = NULL;
     mbuffer->staging_dptr = NULL;
     mbuffer->staging_host = NULL;
@@ -213,42 +259,107 @@ int phxfs_open(int deviceID) {
     int ret = 0;
     bool fresh_open = false;
     if (pb->init_stat) {
-        pb->open_count++;              /* already open: just add a client ref */
+        pb->open_count++;
     } else if (pb->closing) {
-        /* A previous close() flipped init_stat=false and is still draining
-         * in-flight ops outside g_open_lock. Refuse rather than race the
-         * teardown; the caller can retry. */
         ret = -EBUSY;
     } else {
-        ret = __phxfs_open(phxfs_dev_path[deviceID].c_str(), pb, deviceID);
-        if (ret == 0) {
+        const bool force_host = phx_host_mode_requested() && !phx_host_mode_auto();
+        int phxfs_device_id = -1;
+        if (!force_host && devconn && devconn->find_device)
+            phxfs_device_id = devconn->find_device(deviceID);
+
+        if (phxfs_device_id >= 0 &&
+            phxfs_device_id < (int)phxfs_dev_path.size()) {
+            ret = __phxfs_open(phxfs_dev_path[phxfs_device_id].c_str(), pb,
+                               deviceID, phxfs_device_id);
+            if (ret == 0) {
+                pb->open_count = 1;
+                phxfs_initialized[deviceID] = true;
+                fresh_open = true;
+            }
+        } else if (phx_host_mode_requested()) {
+            pb->bdev_fd = -1;
+            pb->device_id = deviceID;
+            pb->phxfs_device_id = -1;
+            pb->closing = false;
+            pb->active_ops = 0;
+            pb->map_mode = PHX_MAP_MODE_HOST;
+            pb->staging_raw = NULL;
+            pb->staging_dptr = NULL;
+            pb->staging_host = NULL;
+            pb->staging_size = 0;
+            pb->init_stat = true;
             pb->open_count = 1;
             phxfs_initialized[deviceID] = true;
             fresh_open = true;
+            fprintf(stderr,
+                    "phxfs_open: CUDA device %d using host staging mode (PHXFS_MODE=%s)\n",
+                    deviceID, std::getenv("PHXFS_MODE"));
+        } else {
+            ret = -ENODEV;
         }
     }
     pthread_mutex_unlock(&g_open_lock);
 
-    /*
-     * Staging mode: allocate + register Phoenix's internal staging pool once,
-     * on the first open, outside g_open_lock (device memory allocation is
-     * heavy and must not block open/close of other devices). If it fails the
-     * device is unusable in staging mode, so roll the open back.
-     */
-    if (ret == 0 && fresh_open && pb->map_mode == PHX_MAP_MODE_STAGING) {
-        int src = phx_staging_setup(deviceID);
+    if (ret == 0 && fresh_open && phx_host_mode_auto() &&
+        pb->map_mode == PHX_MAP_MODE_FULL) {
+        int probe = phx_probe_direct_device(deviceID);
+        if (probe != 0) {
+            fprintf(stderr,
+                    "phxfs_open: direct probe failed on CUDA device %d (%d); "
+                    "using host staging fallback\n", deviceID, probe);
+            phxfs_close(deviceID);
+            pthread_mutex_lock(&g_open_lock);
+            pb->bdev_fd = -1;
+            pb->device_id = deviceID;
+            pb->phxfs_device_id = -1;
+            pb->closing = false;
+            pb->active_ops = 0;
+            pb->map_mode = PHX_MAP_MODE_HOST;
+            pb->staging_raw = NULL;
+            pb->staging_dptr = NULL;
+            pb->staging_host = NULL;
+            pb->staging_size = 0;
+            pb->init_stat = true;
+            pb->open_count = 1;
+            phxfs_initialized[deviceID] = true;
+            pthread_mutex_unlock(&g_open_lock);
+        }
+    }
+
+    if (ret == 0 && fresh_open && pb->map_mode == PHX_MAP_MODE_HOST) {
+        int src = phx_host_staging_setup(deviceID);
         if (src != 0) {
-            fprintf(stderr, "phxfs_open: staging setup failed on dev %d: %d\n",
+            fprintf(stderr, "phxfs_open: host staging setup failed on CUDA device %d: %d\n",
                     deviceID, src);
             phxfs_close(deviceID);
             return src;
         }
     }
+
+    if (ret == 0 && fresh_open && pb->map_mode == PHX_MAP_MODE_STAGING) {
+        int src = phx_staging_setup(deviceID);
+        if (src != 0) {
+            fprintf(stderr, "phxfs_open: staging setup failed on CUDA device %d: %d\n",
+                    deviceID, src);
+            phxfs_close(deviceID);
+            return src;
+        }
+    }
+
     return ret;
 }
 
 int phxfs_find_dev(int device_id) {
-    return devconn->find_device(device_id);
+    if (device_id < 0 || device_id >= g_device_count)
+        return -1;
+    if (phx_host_mode_requested())
+        return device_id;
+    if (!devconn || !devconn->find_device ||
+        devconn->find_device(device_id) < 0)
+        return -1;
+    /* Compatibility helper: public device ids are accelerator ordinals. */
+    return device_id;
 }
 
 uint64_t phxfs_get_page_size(void) {
@@ -256,5 +367,14 @@ uint64_t phxfs_get_page_size(void) {
 }
 
 int phxfs_get_map_mode(int device_id) {
-    return phxfs_read_map_mode(device_id);
+    if (device_id < 0 || device_id >= g_device_count)
+        return -EINVAL;
+    if (mbuffer[device_id].init_stat)
+        return mbuffer[device_id].map_mode;
+    if (phx_host_mode_requested())
+        return PHX_MAP_MODE_HOST;
+    if (!devconn || !devconn->find_device)
+        return -ENODEV;
+    int phxfs_device_id = devconn->find_device(device_id);
+    return phxfs_device_id < 0 ? -ENODEV : phxfs_read_map_mode(phxfs_device_id);
 }

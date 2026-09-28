@@ -33,6 +33,22 @@ enum phxfs_io_op {
     PHXFS_IO_WRITE = 1,
 };
 
+struct phxfs_io_worker_ctx {
+    int index;
+    void *opaque;
+    void (*cleanup)(void *opaque);
+};
+
+struct phxfs_io_op_req;
+typedef int (*phxfs_io_prepare_fn)(struct phxfs_io_op_req *req,
+                                   enum phxfs_io_op op,
+                                   struct phxfs_io_worker_ctx *worker,
+                                   int slot);
+typedef void (*phxfs_io_complete_fn)(struct phxfs_io_op_req *req,
+                                     enum phxfs_io_op op,
+                                     struct phxfs_io_worker_ctx *worker,
+                                     int slot);
+
 /* One resolved request: host_addr is ready to hand to the kernel. */
 struct phxfs_io_op_req {
     int      fd;
@@ -40,7 +56,13 @@ struct phxfs_io_op_req {
     size_t   nbytes;
     off_t    f_offset;
     ssize_t  result;      /* OUT */
+    phxfs_io_prepare_fn  prepare;
+    phxfs_io_complete_fn complete;
+    void    *private_data;
+    int      worker_slot;
 };
+
+#define PHXFS_HOST_STAGE_SLOTS 4
 
 struct phxfs_io_engine {
     const char *name;

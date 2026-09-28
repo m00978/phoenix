@@ -7,6 +7,7 @@ set_property (CACHE PHXFS_VENDOR PROPERTY STRINGS NVIDIA METAX AMD HUAWEI)
 
 if (PHXFS_VENDOR STREQUAL "NVIDIA")
     project (libphoenix LANGUAGES CUDA C CXX)
+    # NVIDIA Hopper and Grace Hopper (H100/GH200) use SM90.
     set (CMAKE_CUDA_ARCHITECTURES 90)
     set (CMAKE_CUDA_STANDARD 20)
 elseif (PHXFS_VENDOR STREQUAL "METAX")
@@ -66,7 +67,7 @@ endif ()
 set (NVIDIA "" CACHE PATH "Path to Nvidia driver source")
 set (KERNEL "/lib/modules/${CMAKE_SYSTEM_VERSION}/build" CACHE PATH "Path to kernel source, or module directory")
 
-set (nvidia_archs "90" CACHE STRING "NVIDIA compute architectures")
+set (nvidia_archs "90" CACHE STRING "NVIDIA compute architectures (SM90 covers Hopper/Grace Hopper)")
 set (no_module false CACHE BOOL "Do not build kernel module")
 set (BUILD_SHARED_LIBS true CACHE BOOL "Build shared library, set to false for static")
 # Default BAR mapping mode baked into phoenixfs.ko: "staging" (default) or
@@ -183,6 +184,7 @@ else ()
 	set (PHXFS_MAP_MODE_DEFAULT 1)
 endif ()
 set (module_ccflags "${module_ccflags} -DPHXFS_MAP_MODE_DEFAULT=${PHXFS_MAP_MODE_DEFAULT}")
+if (NOT no_module)
 configure_file ("${module_root}/Makefile.in" "${module_output}/Makefile" @ONLY)
 message (STATUS "Configuring module build in ${module_output}")
 
@@ -229,6 +231,7 @@ add_custom_target(
     WORKING_DIRECTORY ${module_output}
     COMMENT "Removing kernel module"
 )
+endif ()
 
 
 # Library source files
@@ -280,8 +283,8 @@ endif ()
 # Link liburing for the io_uring batch engine when available.
 if (LIBURING_FOUND)
     target_include_directories(libphoenix PRIVATE ${LIBURING_INCLUDE_DIRS})
-    target_link_libraries(libphoenix ${LIBURING_LIBRARIES})
     target_link_directories(libphoenix PRIVATE ${LIBURING_LIBRARY_DIRS})
+    target_link_libraries(libphoenix ${LIBURING_LIBRARIES})
 endif ()
 # Set install locations
 install (FILES ${libphoenix_include} DESTINATION "include")
@@ -313,4 +316,3 @@ if (PHXFS_VENDOR STREQUAL "NVIDIA" OR PHXFS_VENDOR STREQUAL "METAX"
         OR PHXFS_VENDOR STREQUAL "AMD")
     add_subdirectory ("${PROJECT_SOURCE_DIR}/test/")
 endif ()
-

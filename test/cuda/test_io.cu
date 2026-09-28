@@ -502,9 +502,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int dev_id = phxfs_find_dev_for_cuda_gpu(cuda_gpu_id);
+    int dev_id = cuda_gpu_id;
     if (dev_id < 0) {
-        printf("FATAL: no phxfs device for CUDA GPU %d\n", cuda_gpu_id);
+        printf("FATAL: invalid CUDA GPU %d\n", cuda_gpu_id);
         return 1;
     }
     printf("phxfs device ID: %d\n", dev_id);

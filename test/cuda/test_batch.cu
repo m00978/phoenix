@@ -197,8 +197,8 @@ static void gpu_worker(int gpu, const char *base_file, int do_write,
     out->ok = false; out->bytes = 0; out->secs = 0;
 
     if (cudaSetDevice(gpu) != cudaSuccess) { printf("gpu%d: cudaSetDevice failed\n", gpu); return; }
-    int dev = phxfs_find_dev(gpu);
-    if (dev < 0) { printf("gpu%d: phxfs_find_dev=%d\n", gpu, dev); return; }
+    int dev = gpu;
+    if (dev < 0) { printf("gpu%d: invalid device=%d\n", gpu, dev); return; }
     if (phxfs_open(dev) != 0) { printf("gpu%d: phxfs_open(%d) failed\n", gpu, dev); return; }
 
     const int    NREQ = REQS * BATCHES;

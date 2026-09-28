@@ -10,6 +10,7 @@ Phoenix is a rebuilt version of GPU Direct Storage (GDS) that lets data flow str
 
 ## 📰 News
 
+- **2026.9.28 NVIDIA Grace Hopper / GB10 support** — public device ids are now CUDA ordinals, while internal `phxfs_devN` indices stay private; `PHXFS_MODE=auto` probes the direct path at open and falls back to a preallocated `host_staging` pool when P2P/BAR mapping is unavailable. Batch and async host staging reuse the existing worker/io_uring pipeline.
 - **2026.9.9** — AMD (MI300 series) support: new `amd` P2P backend (amdkfd peer-direct) and HIP connector, validated on 8× Instinct MI308X 
 - **2026.8.27** — [LMCache Phoenix backend released and merged into upstream](https://github.com/LMCache/LMCache/pull/4673),
 - **2026.8.20 Stream-Ordered I/O** - Phoenix now supports stream-ordered asynchronous I/O. The new `phxfs_read_stream` / `phxfs_write_stream` APIs take the stream with each submission, no registration required. Since the DMA is host-driven and invisible to the accelerator runtime, the transfer runs inside a host callback enqueued on the stream via the vendor connector's `launch_host_func` primitive — stream semantics then order read consumers and write gathers by construction, a bare stream synchronize is always sufficient.
@@ -57,7 +58,7 @@ On the direct path Phoenix delivers full storage→GPU DMA with no CPU bounce bu
 
 - OS: Ubuntu 22.04 · Kernel: Linux 6.1 · NVIDIA driver 550.54 (open + `nvidia-fs`) · CUDA 12.4 · MLNX_OFED 24.10
 - Storage backends: NVMe-of, NFS (local NVMe supported for the direct path)
-- Accelerator: NVIDIA GPU (CUDA). NPU: not yet supported by current code.
+- Accelerator: NVIDIA CUDA GPUs, including Hopper/Grace Hopper (SM90); GB10/Grace Blackwell uses the runtime-probed `host_staging` path when direct P2P mapping is unavailable. NPU: not yet supported by current code.
 
 ## Roadmap
 

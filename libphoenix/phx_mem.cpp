@@ -14,6 +14,11 @@
 #include "phoenix.h"
 #include "phx_internal.h"
 
+/* Vendor connector hook: allocate/free a small device probe buffer without
+ * exposing CUDA/HIP headers to the core. */
+extern "C" int phx_connector_probe_alloc(int device_id, size_t size, void **ptr);
+extern "C" void phx_connector_probe_free(void *ptr);
+
 /* Forward decl: defined below, called by free_phxfs_p2p_map. */
 static int __phxfs_deregmem(phxfs_mmap_buffer_t *pb, u64 dev_addr, u64 c_addr, size_t len);
 
@@ -134,7 +139,7 @@ static int __phxfs_regmem(phxfs_mmap_buffer_t *mbuffer, u64 dev_addr, u64 c_addr
     para.map_param.c_vaddr = (u64)c_addr;
     para.map_param.c_size = len;
     para.map_param.n_size = len;
-    para.map_param.dev.dev_id = mbuffer->device_id;
+    para.map_param.dev.dev_id = mbuffer->phxfs_device_id;
     ret = ioctl(mbuffer->bdev_fd, PHXFS_IOCTL_MAP, &para);
     return ret < 0 ? -errno : ret;
 }
@@ -152,10 +157,33 @@ static int __phxfs_deregmem(phxfs_mmap_buffer_t *pb, u64 dev_addr, u64 c_addr, s
     para.map_param.c_vaddr = (u64)c_addr;
     para.map_param.c_size = len;
     para.map_param.n_size = len;
-    para.map_param.dev.dev_id = pb->device_id;
+    para.map_param.dev.dev_id = pb->phxfs_device_id;
 
     ret = ioctl(pb->bdev_fd, PHXFS_IOCTL_UNMAP, &para);
     return ret < 0 ? -errno : ret;
+}
+
+int phx_direct_probe(int device_id) {
+    phxfs_mmap_buffer_t *pb = dev_get(device_id);
+    if (!pb || pb->map_mode != PHX_MAP_MODE_FULL) {
+        if (pb) dev_put(pb);
+        return -ENODEV;
+    }
+    void *dptr = NULL;
+    const size_t probe_size = devconn && devconn->page_size
+        ? (size_t)devconn->page_size : HUGE_PAGE_SIZE;
+    int rc = phx_connector_probe_alloc(device_id, probe_size, &dptr);
+    if (rc == 0) {
+        void *target = NULL;
+        rc = phx_regmem_internal(pb, dptr, probe_size, &target);
+        if (rc == 0)
+            rc = __phxfs_deregmem(pb, (u64)dptr, (u64)target, probe_size);
+        if (target && target != dptr)
+            munmap(target, probe_size);
+        phx_connector_probe_free(dptr);
+    }
+    dev_put(pb);
+    return rc;
 }
 
 /* ------------------------------------------------------------------ */
@@ -338,10 +366,29 @@ int phxfs_regmem(int device_id, const void *addr, size_t len, void **target_addr
      * (a no-op) so callers keep the register-your-buffer contract while the
      * buffer stays free of struct pages and registerable by RDMA/peermem.
      */
-    if (pb->map_mode == PHX_MAP_MODE_STAGING) {
+    if (pb->map_mode == PHX_MAP_MODE_STAGING || pb->map_mode == PHX_MAP_MODE_HOST) {
         *target_addr = (void *)addr;
+        pthread_mutex_lock(&pb->lock);
+        bool overlap = false;
+        phxfs_p2p_map_t *m = regmem_scan_locked(pb, (u64)addr, len, &overlap);
+        if (!m && !overlap) {
+            m = (phxfs_p2p_map_t *)calloc(1, sizeof(*m));
+            if (m) {
+                m->vaddr = (void *)addr;
+                m->dev_addr = (u64)addr;
+                m->length = len;
+                m->user_refs = 1;
+                m->has_reg = true;
+                m->mapped = false;
+                m->next = pb->head;
+                pb->head = m;
+            }
+        } else if (m) {
+            m->user_refs++;
+        }
+        pthread_mutex_unlock(&pb->lock);
         dev_put(pb);
-        return 0;
+        return m ? 0 : (overlap ? -EINVAL : -ENOMEM);
     }
 
     size_t page_size = devconn && devconn->page_size
@@ -382,6 +429,21 @@ int phxfs_deregmem(int device_id, const void *addr, size_t len) {
     if (pb->map_mode == PHX_MAP_MODE_STAGING) {
         dev_put(pb);
         return 0;
+    }
+    if (pb->map_mode == PHX_MAP_MODE_HOST) {
+        pthread_mutex_lock(&pb->lock);
+        phxfs_p2p_map_t *m = pb->head;
+        while (m && (m->dev_addr != (u64)addr || m->length != len))
+            m = m->next;
+        if (m && m->user_refs > 1)
+            m->user_refs--;
+        else if (m) {
+            unlink_locked(pb, m);
+            free(m);
+        }
+        pthread_mutex_unlock(&pb->lock);
+        dev_put(pb);
+        return m ? 0 : -1;
     }
 
     pthread_mutex_lock(&pb->lock);

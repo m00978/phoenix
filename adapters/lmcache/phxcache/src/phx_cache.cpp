@@ -23,13 +23,8 @@ inline size_t align_up(size_t val, size_t alignment) {
 
 PhxCache::PhxCache(int device_id)
     : device_id_(device_id), initialized_(false) {
-    dev_ = phxfs_find_dev(device_id);
-    if (dev_ < 0) {
-        throw std::runtime_error(
-            "PhxCache: phxfs_find_dev(" +
-            std::to_string(device_id) + ") failed with " +
-            std::to_string(dev_));
-    }
+    /* Public Phoenix device ids are CUDA/HIP/NPU ordinals. */
+    dev_ = device_id;
 
     int ret = phxfs_open(dev_);
     if (ret < 0) {

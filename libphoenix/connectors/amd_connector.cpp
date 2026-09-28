@@ -120,50 +120,50 @@ static int amd_find_device(int hip_gpu_id)
 /* ------------------------------------------------------------------ */
 
 /* Reverse of find_device: phxfs index -> HIP device id. */
-static int amd_phxfs_to_hip(int phxfs_dev)
+static int amd_set_device(int device_id)
 {
-    std::string sysfs_path = "/sys/class/phxfs-generic/phxfs_dev"
-                             + std::to_string(phxfs_dev) + "/pci_bdf";
-    std::ifstream ifs(sysfs_path);
-    if (!ifs.is_open())
-        return -1;
-    std::string sysfs_bdf;
-    if (!std::getline(ifs, sysfs_bdf))
-        return -1;
-    while (!sysfs_bdf.empty() &&
-           (sysfs_bdf.back() == '\n' || sysfs_bdf.back() == '\r' ||
-            sysfs_bdf.back() == ' '  || sysfs_bdf.back() == '\t'))
-        sysfs_bdf.pop_back();
-
     int n_gpus = 0;
-    if (hipGetDeviceCount(&n_gpus) != hipSuccess)
-        return -1;
-    for (int g = 0; g < n_gpus; g++) {
-        char hip_bdf[32];
-        if (hipDeviceGetPCIBusId(hip_bdf, sizeof(hip_bdf), g) != hipSuccess)
-            continue;
-        if (bdf_equal(hip_bdf, sysfs_bdf))
-            return g;
-    }
-    return -1;
+    if (hipGetDeviceCount(&n_gpus) != hipSuccess ||
+        device_id < 0 || device_id >= n_gpus ||
+        hipSetDevice(device_id) != hipSuccess)
+        return -ENODEV;
+    return 0;
 }
 
-static int amd_mem_alloc(int phxfs_dev, size_t size, void **dptr)
+static int amd_host_alloc(size_t size, void **ptr)
+{
+    if (!ptr || hipHostMalloc(ptr, size, hipHostMallocPortable) != hipSuccess)
+        return -ENOMEM;
+    return 0;
+}
+
+static void amd_host_free(void *ptr)
+{
+    if (ptr)
+        hipHostFree(ptr);
+}
+
+static int amd_memcpy_h2d(void *dst, const void *src, size_t n)
+{
+    return hipMemcpy(dst, src, n, hipMemcpyHostToDevice) == hipSuccess ? 0 : -EIO;
+}
+
+static int amd_memcpy_d2h(void *dst, const void *src, size_t n)
+{
+    return hipMemcpy(dst, src, n, hipMemcpyDeviceToHost) == hipSuccess ? 0 : -EIO;
+}
+
+static int amd_mem_alloc(int device_id, size_t size, void **dptr)
 {
     if (!dptr)
         return -EINVAL;
-    int hip_id = amd_phxfs_to_hip(phxfs_dev);
-    if (hip_id < 0) {
-        fprintf(stderr, "amd_mem_alloc: no HIP device for phxfs dev %d\n",
-                phxfs_dev);
+    int n_gpus = 0;
+    if (hipGetDeviceCount(&n_gpus) != hipSuccess ||
+        device_id < 0 || device_id >= n_gpus)
         return -ENODEV;
-    }
-    /* Allocate on the phxfs device's accelerator, but restore the caller's
-     * current device afterwards so we don't disturb the application's HIP
-     * context state. */
     int prev = -1;
     (void)hipGetDevice(&prev);
-    if (hipSetDevice(hip_id) != hipSuccess)
+    if (hipSetDevice(device_id) != hipSuccess)
         return -EIO;
     void *p = nullptr;
     hipError_t rc = hipMalloc(&p, size);
@@ -205,16 +205,18 @@ static int amd_memcpy_dtod(void *dst, const void *src, size_t n)
 static hipStream_t     g_streams[PHXFS_DEV_SCAN_MAX][AMD_MAX_QUEUES];
 static pthread_mutex_t g_stream_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static int amd_stream_get(int phxfs_dev, int slot, hipStream_t *out)
+static int amd_stream_get(int device_id, int slot, hipStream_t *out)
 {
-    if (phxfs_dev < 0 || phxfs_dev >= PHXFS_DEV_SCAN_MAX ||
+    if (device_id < 0 || device_id >= PHXFS_DEV_SCAN_MAX ||
         slot < 0 || slot >= AMD_MAX_QUEUES)
         return -EINVAL;
 
     pthread_mutex_lock(&g_stream_lock);
-    if (g_streams[phxfs_dev][slot] == nullptr) {
-        int hip_id = amd_phxfs_to_hip(phxfs_dev);
-        if (hip_id < 0) {
+    if (g_streams[device_id][slot] == nullptr) {
+        int hip_id = device_id;
+        int n_gpus = 0;
+        if (hipGetDeviceCount(&n_gpus) != hipSuccess ||
+            hip_id < 0 || hip_id >= n_gpus) {
             pthread_mutex_unlock(&g_stream_lock);
             return -ENODEV;
         }
@@ -234,9 +236,9 @@ static int amd_stream_get(int phxfs_dev, int slot, hipStream_t *out)
             pthread_mutex_unlock(&g_stream_lock);
             return -EIO;
         }
-        g_streams[phxfs_dev][slot] = s;
+        g_streams[device_id][slot] = s;
     }
-    *out = g_streams[phxfs_dev][slot];
+    *out = g_streams[device_id][slot];
     pthread_mutex_unlock(&g_stream_lock);
     return 0;
 }
@@ -339,6 +341,11 @@ static struct devconn_ops amd_devconn = {
     .mem_alloc    = amd_mem_alloc,
     .mem_free     = amd_mem_free,
     .memcpy_dtod  = amd_memcpy_dtod,
+    .host_alloc   = amd_host_alloc,
+    .host_free    = amd_host_free,
+    .set_device   = amd_set_device,
+    .memcpy_h2d   = amd_memcpy_h2d,
+    .memcpy_d2h   = amd_memcpy_d2h,
     .memcpy_dtod_async = amd_memcpy_dtod_async,
     .queue_sync   = amd_queue_sync,
     .launch_host_func = amd_launch_host_func,

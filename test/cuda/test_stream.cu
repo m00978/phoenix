@@ -141,7 +141,7 @@ int main(int argc, char **argv) {
                tests_run, tests_passed, tests_failed, tests_skipped + 1);
         return 0;
     }
-    int dev = phxfs_find_dev(0);
+    int dev = 0;
     if (dev < 0) {
         SKIP("phxfs device not found for CUDA device 0 (module loaded?)");
         printf("%d run, %d passed, %d failed, %d skipped\n",

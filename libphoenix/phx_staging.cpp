@@ -306,6 +306,7 @@ static void run_device(int d, phxfs_io_req_t *reqs, int n, int is_write) {
         for (size_t i = 0; i < grp.size(); i++) {
             const Tile &t = tiles[grp[i]];
             struct phxfs_io_op_req &o = ops[slot][i];
+            o = {};
             o.fd        = t.fd;
             o.host_addr = host[slot] + slot_off[grp[i]];
             o.nbytes    = t.len;

@@ -7,7 +7,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <pthread.h>
+#include <vector>
 #include <unistd.h>
 
 #include "phoenix.h"
@@ -28,9 +30,94 @@ static bool device_is_staging(int device_id) {
            mbuffer[device_id].map_mode == PHX_MAP_MODE_STAGING;
 }
 
+static bool device_is_host(int device_id) {
+    return device_id >= 0 && device_id < g_device_count &&
+           mbuffer[device_id].map_mode == PHX_MAP_MODE_HOST;
+}
+
+static ssize_t host_xfer(int fd, int device_id, void *buf, off_t buf_offset,
+                         size_t nbyte, off_t f_offset, bool is_write) {
+    phxfs_mmap_buffer_t *pb = dev_get(device_id);
+    if (!pb || pb->map_mode != PHX_MAP_MODE_HOST) {
+        if (pb)
+            dev_put(pb);
+        return -ENODEV;
+    }
+    if (!devconn || !devconn->memcpy_h2d || !devconn->memcpy_d2h) {
+        dev_put(pb);
+        return -ENOTSUP;
+    }
+
+    void *base = NULL;
+    phxfs_p2p_map_t *node = NULL;
+    if (resolve_registered(device_id, buf, buf_offset, nbyte,
+                           &base, &node) != 1) {
+        dev_put(pb);
+        return -EFAULT;
+    }
+
+    int slot = -1;
+    void *staging = phx_host_staging_acquire(pb, &slot);
+    if (!staging) {
+        map_release(pb, node);
+        dev_put(pb);
+        return -ENOMEM;
+    }
+
+    ssize_t total = 0;
+    int error = 0;
+    while ((size_t)total < nbyte) {
+        size_t chunk = std::min((size_t)PHX_HOST_STAGING_BYTES,
+                                nbyte - (size_t)total);
+        char *gpu = (char *)base + total;
+        off_t file_off = f_offset + (off_t)total;
+        if (is_write) {
+            error = devconn->memcpy_d2h(staging, gpu, chunk);
+            if (error != 0)
+                break;
+            ssize_t moved = xfer(fd, staging, (ssize_t)chunk,
+                                 file_off, true);
+            if (moved < 0) {
+                error = (int)moved;
+                break;
+            }
+            total += moved;
+            if ((size_t)moved != chunk)
+                break;
+        } else {
+            ssize_t moved = xfer(fd, staging, (ssize_t)chunk,
+                                 file_off, false);
+            if (moved < 0) {
+                error = (int)moved;
+                break;
+            }
+            if (moved > 0) {
+                error = devconn->memcpy_h2d(gpu, staging, (size_t)moved);
+                if (error != 0)
+                    break;
+                total += moved;
+            }
+            if ((size_t)moved != chunk)
+                break;
+        }
+    }
+
+    phx_host_staging_release(pb, slot);
+    map_release(pb, node);
+    dev_put(pb);
+    return error != 0 && total == 0 ? error : total;
+}
+
 static bool batch_uses_staging(phxfs_io_req_t *reqs, int n) {
     for (int i = 0; i < n; i++)
         if (device_is_staging(reqs[i].device_id))
+            return true;
+    return false;
+}
+
+static bool batch_uses_host(phxfs_io_req_t *reqs, int n) {
+    for (int i = 0; i < n; i++)
+        if (device_is_host(reqs[i].device_id))
             return true;
     return false;
 }
@@ -118,6 +205,10 @@ ssize_t phxfs_read(int fd, int device_id, void *buf, off_t buf_offset, ssize_t n
         return r.result;
     }
 
+    if (device_is_host(device_id))
+        return host_xfer(fd, device_id, buf, buf_offset, (size_t)nbyte,
+                         f_offset, false);
+
     phxfs_mmap_buffer_t *pb = dev_get(device_id);
     if (!pb)
         return -1;
@@ -153,6 +244,10 @@ ssize_t phxfs_write(int fd, int device_id, void *buf, off_t buf_offset, ssize_t 
         phx_staging_batch(&r, 1, /*is_write=*/1);
         return r.result;
     }
+
+    if (device_is_host(device_id))
+        return host_xfer(fd, device_id, buf, buf_offset, (size_t)nbyte,
+                         f_offset, true);
 
     phxfs_mmap_buffer_t *pb = dev_get(device_id);
     if (!pb)
@@ -249,6 +344,233 @@ struct batch_ctx {
     bool                    dev_held[PHXFS_MAX_DEVICES]; /* dev_get()'d */
 };
 
+
+
+/* Host fallback uses the same pool/ring machinery as direct I/O. Each worker
+ * reuses a small fixed set of pinned buffers, while adjacent requests are
+ * coalesced into <=16 MiB slices before they reach the pool. */
+static constexpr size_t PHX_HOST_STAGE_BYTES = 16ULL * 1024 * 1024;
+
+struct host_worker_state {
+    void *buffers[PHXFS_HOST_STAGE_SLOTS]{};
+    int current_device = -1;
+};
+
+struct host_slice {
+    int first_req = -1;
+    int req_count = 0;
+    int device_id = -1;
+    int fd = -1;
+    void *gpu_addr = nullptr;
+    size_t bytes = 0;
+    off_t file_offset = 0;
+};
+
+struct host_batch_ctx {
+    std::vector<phxfs_io_op_req> ops;
+    std::vector<host_slice> slices;
+    std::vector<phxfs_p2p_map_t *> nodes;
+    std::vector<int> devs;
+    bool dev_held[PHXFS_MAX_DEVICES]{};
+    int resolve_fail = 0;
+    phxfs_io_req_t *reqs = nullptr;
+    int nreq = 0;
+};
+
+static void host_worker_cleanup(void *opaque) {
+    host_worker_state *state = static_cast<host_worker_state *>(opaque);
+    if (state) {
+        if (devconn && devconn->host_free)
+            for (void *buffer : state->buffers)
+                if (buffer)
+                    devconn->host_free(buffer);
+        delete state;
+    }
+}
+
+static host_worker_state *host_worker_get(struct phxfs_io_worker_ctx *worker) {
+    if (!worker)
+        return nullptr;
+    if (!worker->opaque) {
+        worker->opaque = new host_worker_state();
+        worker->cleanup = host_worker_cleanup;
+    }
+    return static_cast<host_worker_state *>(worker->opaque);
+}
+
+static int host_prepare(phxfs_io_op_req *op, enum phxfs_io_op direction,
+                        struct phxfs_io_worker_ctx *worker, int slot) {
+    host_slice *slice = static_cast<host_slice *>(op->private_data);
+    host_worker_state *state = host_worker_get(worker);
+    if (!slice || !state || slot < 0 || slot >= PHXFS_HOST_STAGE_SLOTS ||
+        !devconn || !devconn->host_alloc)
+        return -EINVAL;
+
+    if (state->current_device != slice->device_id) {
+        if (devconn->set_device &&
+            devconn->set_device(slice->device_id) != 0)
+            return -ENODEV;
+        state->current_device = slice->device_id;
+    }
+    if (!state->buffers[slot] &&
+        devconn->host_alloc(PHX_HOST_STAGE_BYTES, &state->buffers[slot]) != 0)
+        return -ENOMEM;
+
+    op->host_addr = state->buffers[slot];
+    if (direction == PHXFS_IO_WRITE &&
+        devconn->memcpy_d2h(op->host_addr, slice->gpu_addr, slice->bytes) != 0)
+        return -EIO;
+    return 0;
+}
+
+static void host_complete(phxfs_io_op_req *op, enum phxfs_io_op direction,
+                          struct phxfs_io_worker_ctx *worker, int slot) {
+    (void)slot;
+    if (direction != PHXFS_IO_READ || op->result <= 0)
+        return;
+    host_slice *slice = static_cast<host_slice *>(op->private_data);
+    host_worker_state *state = host_worker_get(worker);
+    if (!slice || !state || !devconn ||
+        (devconn->set_device && devconn->set_device(slice->device_id) != 0) ||
+        !devconn->memcpy_h2d ||
+        devconn->memcpy_h2d(slice->gpu_addr, op->host_addr,
+                            (size_t)op->result) != 0)
+        op->result = -EIO;
+    else
+        state->current_device = slice->device_id;
+}
+
+static void host_batch_release(host_batch_ctx *bc) {
+    if (!bc)
+        return;
+    if (!bc->nodes.empty())
+        batch_release_mappings(bc->devs.data(), bc->nodes.data(), bc->nreq);
+    for (int d = 0; d < g_device_count; d++)
+        if (bc->dev_held[d])
+            dev_put(&mbuffer[d]);
+}
+
+static int host_batch_finalize(host_batch_ctx *bc) {
+    for (size_t k = 0; k < bc->ops.size(); k++) {
+        host_slice &slice = bc->slices[k];
+        ssize_t op_result = bc->ops[k].result;
+        size_t done = op_result > 0
+            ? std::min((size_t)op_result, slice.bytes) : 0;
+        size_t remaining = done;
+        for (int j = 0; j < slice.req_count && remaining > 0; j++) {
+            phxfs_io_req_t &req = bc->reqs[slice.first_req + j];
+            size_t add = std::min(remaining, req.nbytes);
+            req.result += (ssize_t)add;
+            remaining -= add;
+        }
+        if (op_result < 0) {
+            for (int j = 0; j < slice.req_count; j++) {
+                phxfs_io_req_t &req = bc->reqs[slice.first_req + j];
+                if (req.result == 0)
+                    req.result = op_result;
+            }
+        }
+    }
+
+    int failed = 0;
+    for (int i = 0; i < bc->nreq; i++)
+        if (bc->reqs[i].result != (ssize_t)bc->reqs[i].nbytes)
+            failed++;
+    return failed;
+}
+
+static int host_batch_prepare(phxfs_io_req_t *reqs, int n,
+                              host_batch_ctx *bc) {
+    bc->reqs = reqs;
+    bc->nreq = n;
+    bc->nodes.assign((size_t)n, nullptr);
+    bc->devs.assign((size_t)n, -1);
+    std::vector<void *> hosts((size_t)n, nullptr);
+
+    for (int i = 0; i < n; i++) {
+        int d = reqs[i].device_id;
+        bc->devs[i] = d;
+        if (d >= 0 && d < g_device_count && !bc->dev_held[d])
+            if (dev_get(d))
+                bc->dev_held[d] = true;
+    }
+    batch_resolve_registered(reqs, n, bc->dev_held, hosts.data(),
+                             bc->nodes.data());
+
+    bc->ops.reserve((size_t)n);
+    bc->slices.reserve((size_t)n);
+    for (int i = 0; i < n; i++) {
+        reqs[i].result = -EFAULT;
+        int d = reqs[i].device_id;
+        bool valid = reqs[i].f_offset >= 0 &&
+                     (uint64_t)reqs[i].nbytes <=
+                         (uint64_t)INT64_MAX - (uint64_t)reqs[i].f_offset;
+        void *base = hosts[i];
+        if (d < 0)
+            valid = valid && resolve_cpu_buf(reqs[i].buf, reqs[i].buf_offset,
+                                             reqs[i].nbytes, &base) == 0;
+        if (!valid || !base) {
+            bc->resolve_fail++;
+            continue;
+        }
+        reqs[i].result = 0;
+        if (reqs[i].nbytes == 0)
+            continue;
+
+        size_t off = 0;
+        while (off < reqs[i].nbytes) {
+            size_t piece = std::min(PHX_HOST_STAGE_BYTES,
+                                    reqs[i].nbytes - off);
+            bool can_merge = off == 0 && reqs[i].nbytes <= PHX_HOST_STAGE_BYTES &&
+                !bc->slices.empty() &&
+                bc->slices.back().first_req + bc->slices.back().req_count == i &&
+                bc->slices.back().device_id == d &&
+                bc->slices.back().fd == reqs[i].fd &&
+                (char *)bc->slices.back().gpu_addr + bc->slices.back().bytes ==
+                    (char *)base + off &&
+                bc->slices.back().file_offset +
+                    (off_t)bc->slices.back().bytes == reqs[i].f_offset +
+                    (off_t)off &&
+                bc->slices.back().bytes + piece <= PHX_HOST_STAGE_BYTES;
+            if (can_merge) {
+                host_slice &slice = bc->slices.back();
+                slice.bytes += piece;
+                slice.req_count++;
+                bc->ops.back().nbytes += piece;
+            } else {
+                host_slice slice;
+                slice.first_req = i;
+                slice.req_count = 1;
+                slice.device_id = d;
+                slice.fd = reqs[i].fd;
+                slice.gpu_addr = (char *)base + off;
+                slice.bytes = piece;
+                slice.file_offset = reqs[i].f_offset + (off_t)off;
+                bc->slices.push_back(slice);
+
+                phxfs_io_op_req op{};
+                op.fd = reqs[i].fd;
+                op.host_addr = base;
+                op.nbytes = piece;
+                op.f_offset = slice.file_offset;
+                op.result = -EFAULT;
+                bc->ops.push_back(op);
+            }
+            off += piece;
+        }
+    }
+
+    /* The vector may have moved while it was built; repair callback pointers. */
+    for (size_t k = 0; k < bc->ops.size(); k++) {
+        bc->ops[k].private_data = &bc->slices[k];
+        if (device_is_host(bc->slices[k].device_id)) {
+            bc->ops[k].prepare = host_prepare;
+            bc->ops[k].complete = host_complete;
+        }
+    }
+    return 0;
+}
+
 static void batch_ctx_free(struct batch_ctx *bc) {
     free(bc->ops);   bc->ops = NULL;
     free(bc->map);   bc->map = NULL;
@@ -274,7 +596,8 @@ static void batch_ctx_release(struct batch_ctx *bc) {
  * bc->dev_held, so a concurrent close() waits until batch completion.
  * Returns 0, or -ENOMEM.
  */
-static int phxfs_batch_prepare(phxfs_io_req_t *reqs, int n, struct batch_ctx *bc) {
+static int phxfs_batch_prepare(phxfs_io_req_t *reqs, int n,
+                               struct batch_ctx *bc) {
     memset(bc, 0, sizeof(*bc));
     bc->ops   = (struct phxfs_io_op_req *)malloc((size_t)n * sizeof(*bc->ops));
     bc->map   = (int *)malloc((size_t)n * sizeof(*bc->map));
@@ -328,6 +651,7 @@ static int phxfs_batch_prepare(phxfs_io_req_t *reqs, int n, struct batch_ctx *bc
             fail++;
             continue;
         }
+        bc->ops[cnt] = {};
         bc->ops[cnt].fd = reqs[i].fd;
         bc->ops[cnt].host_addr = host;
         bc->ops[cnt].nbytes = reqs[i].nbytes;
@@ -354,7 +678,22 @@ static int phxfs_batch(phxfs_io_req_t *reqs, int n, enum phxfs_io_op op) {
      * mode is global, so a single staging device implies all are staging. */
     if (batch_uses_staging(reqs, n))
         return phx_staging_batch(reqs, n, op == PHXFS_IO_WRITE);
-
+    if (batch_uses_host(reqs, n)) {
+        host_batch_ctx bc;
+        if (host_batch_prepare(reqs, n, &bc) < 0)
+            return -ENOMEM;
+        int ret = 0;
+        if (!bc.ops.empty()) {
+            phx_range_push("phx.io.pool_run.host_staging");
+            ret = phxfs_pool_run(bc.ops.data(), (int)bc.ops.size(), op);
+            phx_range_pop();
+        }
+        int failures = host_batch_finalize(&bc);
+        host_batch_release(&bc);
+        if (ret < 0)
+            return ret;
+        return failures;
+    }
     struct batch_ctx bc;
     if (phxfs_batch_prepare(reqs, n, &bc) < 0)
         return -ENOMEM;
@@ -396,6 +735,7 @@ struct phxfs_batch {
     bool                     staging;  /* staging-mode batch: run at wait() time */
     int                      staging_n;
     int                      staging_is_write;
+    host_batch_ctx          *host_bc;
 };
 
 static phxfs_batch_t *phxfs_batch_submit(phxfs_io_req_t *reqs, int n,
@@ -420,7 +760,27 @@ static phxfs_batch_t *phxfs_batch_submit(phxfs_io_req_t *reqs, int n,
         h->staging_is_write = (op == PHXFS_IO_WRITE);
         return h;
     }
-
+    if (batch_uses_host(reqs, n)) {
+        h->host_bc = new host_batch_ctx();
+        if (host_batch_prepare(reqs, n, h->host_bc) < 0) {
+            host_batch_release(h->host_bc);
+            delete h->host_bc;
+            free(h);
+            return NULL;
+        }
+        if (!h->host_bc->ops.empty()) {
+            h->pool_h = phxfs_pool_submit(h->host_bc->ops.data(),
+                                          (int)h->host_bc->ops.size(),
+                                          op, /*blocking=*/true);
+            if (!h->pool_h) {
+                host_batch_release(h->host_bc);
+                delete h->host_bc;
+                free(h);
+                return NULL;
+            }
+        }
+        return h;
+    }
     if (phxfs_batch_prepare(reqs, n, &h->bc) < 0) {
         free(h);
         return NULL;
@@ -466,6 +826,14 @@ int phxfs_batch_wait(phxfs_batch_t *h) {
         free(h);
         return fails;
     }
+    if (h->host_bc) {
+        int ret = h->pool_h ? phxfs_pool_wait(h->pool_h) : 0;
+        int failures = host_batch_finalize(h->host_bc);
+        host_batch_release(h->host_bc);
+        delete h->host_bc;
+        free(h);
+        return ret < 0 ? ret : failures;
+    }
 
     int ret = 0;
     if (h->pool_h) {
@@ -503,6 +871,14 @@ int phxfs_batch_destroy(phxfs_batch_t *h) {
 
     if (h->staging) {
         /* Nothing was submitted at submit() time; just drop the handle. */
+        free(h);
+        return 0;
+    }
+    if (h->host_bc) {
+        if (h->pool_h)
+            (void)phxfs_pool_wait(h->pool_h);
+        host_batch_release(h->host_bc);
+        delete h->host_bc;
         free(h);
         return 0;
     }

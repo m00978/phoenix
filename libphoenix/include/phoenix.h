@@ -20,6 +20,9 @@
 extern "C" {
 #endif
 
+/* All non-negative device_id arguments are vendor accelerator ordinals
+ * (CUDA device id for NVIDIA, HIP device id for AMD). The library maps the
+ * ordinal to an internal phxfs device when the kernel module is present. */
 int phxfs_open(int device_id);
 int phxfs_close(int device_id);
 
@@ -36,7 +39,8 @@ uint64_t phxfs_get_page_size(void);
 int phxfs_get_map_mode(int device_id);
 
 /*
- * Map a vendor-specific device ID to a phxfs device index.
+ * Validate a vendor accelerator ordinal. Returns the same public device id
+ * on success; kept as a compatibility helper for older callers.
  * The vendor is selected at build time (PHXFS_VENDOR).
  *   NVIDIA: device_id is a CUDA device ID
  *   AMD:    device_id is a HIP device ID
@@ -69,7 +73,7 @@ int phxfs_deregmem(int device, const void *addr, size_t len);
 /*
  * device_id selects the target buffer the same way as the batch API below:
  *   - device_id >= 0: `buf` must lie inside a GPU registration on that
- *     phxfs device (phxfs_regmem), or the call fails.
+ *     accelerator device (phxfs_regmem), or the call fails.
  *   - device_id  < 0: `buf` is a plain CPU (host) address.
  */
 ssize_t phxfs_read(int fd, int device_id, void *buf, off_t buf_offset, ssize_t nbyte, off_t f_offset);

@@ -66,12 +66,14 @@ struct pool_job {
     int              completed;/* ops accounted (== n -> done) */
     int              failed;   /* OUT: accumulated failure count (under mtx) */
     int              err;      /* OUT: first engine-level (<0) error, else 0 */
+    bool             has_callbacks;
     bool             done;     /* set once every op has been accounted */
     struct pool_job *next;     /* FIFO link */
 };
 
 struct worker {
     pthread_t tid;
+    struct phxfs_io_worker_ctx ctx;
 };
 
 struct pool_state {
@@ -98,9 +100,32 @@ static pthread_once_t    g_once = PTHREAD_ONCE_INIT;
  * contiguous, so the engine writes straight into the caller's array.
  */
 static void worker_run_chunk(struct pool_job *job, int base, int cnt,
+                             struct phxfs_io_worker_ctx *worker,
                              int *out_failed, int *out_err) {
     const struct phxfs_io_engine *eng = phxfs_io_engine_get();
     struct phxfs_io_op_req *ops = &job->reqs[base];
+
+    int prep_failed = 0;
+    int callback_slots = 0;
+    for (int k = 0; k < cnt; k++) {
+        ops[k].worker_slot = -1;
+        if (!ops[k].prepare)
+            continue;
+        if (callback_slots >= PHXFS_HOST_STAGE_SLOTS ||
+            ops[k].prepare(&ops[k], job->op, worker, callback_slots) != 0) {
+            prep_failed = -ENOMEM;
+            break;
+        }
+        ops[k].worker_slot = callback_slots++;
+    }
+
+    if (prep_failed) {
+        for (int k = 0; k < cnt; k++)
+            ops[k].result = prep_failed;
+        *out_failed = cnt;
+        *out_err = prep_failed;
+        return;
+    }
 
     int rc = eng->submit_batch(ops, cnt, job->op);
     if (rc < 0) {
@@ -110,10 +135,15 @@ static void worker_run_chunk(struct pool_job *job, int base, int cnt,
             ops[k].result = rc;
         *out_failed = cnt;
         *out_err = rc;
-        return;
+    } else {
+        *out_failed = rc;   /* engine contract: >=0 is the failed-request count */
+        *out_err = 0;
     }
-    *out_failed = rc;   /* engine contract: >=0 is the failed-request count */
-    *out_err = 0;
+
+    for (int k = 0; k < cnt; k++) {
+        if (ops[k].complete)
+            ops[k].complete(&ops[k], job->op, worker, ops[k].worker_slot);
+    }
 }
 
 /*
@@ -166,7 +196,8 @@ static void job_remove_locked(struct pool_state *p, struct pool_job *job) {
 
 static void *worker_main(void *arg) {
     struct pool_state *p = &g_pool;
-    (void)arg;
+    struct worker *worker = (struct worker *)arg;
+    struct phxfs_io_worker_ctx *worker_ctx = &worker->ctx;
 
     pthread_mutex_lock(&p->mtx);
     for (;;) {
@@ -178,6 +209,8 @@ static void *worker_main(void *arg) {
              * waiter is ever left hanging by a shutdown. */
             if (p->stop && p->inflight == 0) {
                 pthread_mutex_unlock(&p->mtx);
+                if (worker_ctx->cleanup && worker_ctx->opaque)
+                    worker_ctx->cleanup(worker_ctx->opaque);
                 return NULL;
             }
             pthread_cond_wait(&p->work_cv, &p->mtx);
@@ -191,7 +224,7 @@ static void *worker_main(void *arg) {
          * set once completed == n, and this chunk is counted below.
          */
         int lfailed = 0, lerr = 0;
-        worker_run_chunk(job, base, cnt, &lfailed, &lerr);
+        worker_run_chunk(job, base, cnt, worker_ctx, &lfailed, &lerr);
 
         pthread_mutex_lock(&p->mtx);
         job->failed += lfailed;
@@ -237,7 +270,11 @@ static void pool_init(void) {
     p->stop = false;
     p->nthreads = PHXFS_POOL_THREADS;
     for (int t = 0; t < p->nthreads; t++) {
-        if (pthread_create(&p->workers[t].tid, NULL, worker_main, NULL) != 0) {
+        p->workers[t].ctx.index = t;
+        p->workers[t].ctx.opaque = NULL;
+        p->workers[t].ctx.cleanup = NULL;
+        if (pthread_create(&p->workers[t].tid, NULL, worker_main,
+                           &p->workers[t]) != 0) {
             p->nthreads = t;
             break;
         }
@@ -293,6 +330,13 @@ static int job_enqueue(struct pool_state *p, struct pool_job *job, bool blocking
     job->failed = 0;
     job->err = 0;
     job->next = NULL;
+    job->has_callbacks = false;
+    for (int i = 0; i < job->n; i++) {
+        if (job->reqs[i].prepare || job->reqs[i].complete) {
+            job->has_callbacks = true;
+            break;
+        }
+    }
     /*
      * Claim size: spread the job over every worker (so a small batch still
      * uses all rings, as the previous striped model did), capped so a huge
@@ -305,6 +349,8 @@ static int job_enqueue(struct pool_state *p, struct pool_job *job, bool blocking
         job->chunk = PHXFS_POOL_CHUNK_MAX;
     if (job->chunk < 1)
         job->chunk = 1;
+    if (job->has_callbacks && job->chunk > PHXFS_HOST_STAGE_SLOTS)
+        job->chunk = PHXFS_HOST_STAGE_SLOTS;
     if (p->q_tail) p->q_tail->next = job; else p->q_head = job;
     p->q_tail = job;
     if (!p->rr)
@@ -331,8 +377,17 @@ int phxfs_pool_run(struct phxfs_io_op_req *reqs, int n, enum phxfs_io_op op) {
 
     struct pool_state *p = pool_get();
     if (!p) {
-        const struct phxfs_io_engine *eng = phxfs_io_engine_get();
-        return eng->submit_batch(reqs, n, op);
+        struct pool_job job{};
+        struct phxfs_io_worker_ctx worker{};
+        int failed = 0, err = 0;
+        job.reqs = reqs;
+        job.n = n;
+        job.op = op;
+        worker.index = -1;
+        worker_run_chunk(&job, 0, n, &worker, &failed, &err);
+        if (worker.cleanup && worker.opaque)
+            worker.cleanup(worker.opaque);
+        return err < 0 ? err : failed;
     }
 
     /* Synchronous: stack job (valid until we wait it), blocking enqueue. */
